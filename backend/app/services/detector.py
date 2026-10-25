@@ -1,0 +1,486 @@
+"""水印检测算法模块。
+
+策略（两阶段、纯规则、零模型依赖）：
+  阶段1 —— 平台先验候选区域：各平台水印(TikTok/抖音/小红书)出现位置已知(角落/底部条带)
+  阶段2 —— 区域内亮/暗双通道形态学分析：
+            * 亮通道: 白色文字/logo 前景 (阈值二值化)
+            * 暗通道: 水印阴影/深色图形 (反阈值)
+            * 闭运算+膨胀把文字笔画连成块 → 轮廓外接矩形
+            * 形状/面积/填充率过滤误检
+  视频模式：多时间点采样 → 位置聚类成时间轨(Track)，天然支持 TikTok 移动水印。
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, asdict
+
+import cv2
+import numpy as np
+
+# 候选区域 (名称, x, y, w, h) —— 相对坐标，覆盖已知平台水印位置
+# 实测布局: 抖音=左上(前段)+右下(全程) 抖音号/logo/搜索标签;
+#           TikTok竖屏=左侧中部(随时间移至右侧); 小红书=右上/右下/底部
+CANDIDATE_ZONES = [
+    ("top-left",     0.00, 0.00, 0.50, 0.18),
+    ("top-right",    0.50, 0.00, 0.50, 0.18),
+    ("left-mid",     0.00, 0.12, 0.30, 0.42),
+    ("right-mid",    0.70, 0.12, 0.30, 0.42),
+    ("bottom-left",  0.00, 0.78, 0.42, 0.22),
+    ("bottom-right", 0.55, 0.70, 0.45, 0.30),
+]
+
+BRIGHT_THRESHOLD = 193  # 白色前景亮度阈值
+DARK_THRESHOLD = 58     # 深色阴影阈值
+MIN_W = 24              # 最小矩形宽
+MIN_H = 7               # 最小矩形高
+MAX_ZONE_COVER = 0.55    # 矩形不许超过候选区域面积的一半(防背景误检)
+MIN_FILL = 0.12         # 原二值图在矩形内的填充率下限
+MAX_REGION_W = 0.34     # 单区域最大宽度(相对帧宽) —— 超过视为内容块
+MAX_REGION_H = 0.22     # 单区域最大高度(相对帧高, 兼容 logo+两行文字+阴影)
+SUBTITLE_GUARD_X = (0.30, 0.70)  # 底部中央字幕保护带(相对宽度)
+EDGE_MARGIN = 0.025     # 贴边判定: 距任一边 < 2.5% 视为贴边
+PAD = 6                 # 输出矩形外扩像素
+
+
+@dataclass
+class Region:
+    """帧坐标系下的水印矩形区域。"""
+    x: int
+    y: int
+    w: int
+    h: int
+    conf: float = 0.85
+
+    @property
+    def x2(self) -> int:
+        return self.x + self.w
+
+    @property
+    def y2(self) -> int:
+        return self.y + self.h
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+# ---------------- 基础几何工具 ----------------
+
+def _iou(a, b) -> float:
+    """a,b: (x1,y1,x2,y2)"""
+    ix = max(0, min(a[2], b[2]) - max(a[0], b[0]))
+    iy = max(0, min(a[3], b[3]) - max(a[1], b[1]))
+    inter = ix * iy
+    if inter == 0:
+        return 0.0
+    area_a = (a[2] - a[0]) * (a[3] - a[1])
+    area_b = (b[2] - b[0]) * (b[3] - b[1])
+    return inter / float(area_a + area_b - inter)
+
+
+def _near(a, b, dist=14) -> bool:
+    """边界间距小于 dist 视为紧邻(需合并)。"""
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    if ax1 > bx2 + dist or bx1 > ax2 + dist:
+        return False
+    if ay1 > by2 + dist or by1 > ay2 + dist:
+        return False
+    return True
+
+
+def _merge_rects(rects, iou_th=0.02):
+    """迭代合并重叠/紧邻矩形，取外接并集。rects: [(x1,y1,x2,y2)]"""
+    boxes = [list(r) for r in rects]
+    changed = True
+    while changed and len(boxes) > 1:
+        changed = False
+        out = []
+        while boxes:
+            b = boxes.pop()
+            i = 0
+            while i < len(boxes):
+                a = boxes[i]
+                if _iou(b, a) > iou_th or _near(b, a):
+                    b = [min(b[0], a[0]), min(b[1], a[1]),
+                         max(b[2], a[2]), max(b[3], a[3])]
+                    boxes.pop(i)
+                    changed = True
+                else:
+                    i += 1
+            out.append(b)
+        boxes = out
+    return [tuple(b) for b in boxes]
+
+
+# ---------------- 区域内分析 ----------------
+
+def _rect_fill(binary: np.ndarray, x, y, w, h) -> float:
+    sub = binary[y:y + h, x:x + w]
+    if sub.size == 0:
+        return 0.0
+    return float((sub > 0).mean())
+
+
+def _analyze_zone(gray: np.ndarray, zx: int, zy: int, zw: int, zh: int):
+    """在单个候选区域内检测水印元素，返回帧坐标矩形列表 (x1,y1,x2,y2)。"""
+    if zw < 40 or zh < 20:
+        return []
+    roi = gray[zy:zy + zh, zx:zx + zw]
+    rects = []
+
+    bright = cv2.threshold(roi, BRIGHT_THRESHOLD, 255, cv2.THRESH_BINARY)[1]
+    dark = cv2.threshold(roi, DARK_THRESHOLD, 255, cv2.THRESH_BINARY_INV)[1]
+
+    close_k = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 5))
+    dil_k = cv2.getStructuringElement(cv2.MORPH_RECT, (11, 5))
+
+    for binary in (bright, dark):
+        processed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, close_k)
+        dil = cv2.dilate(processed, dil_k)
+        contours, _ = cv2.findContours(dil, cv2.RETR_EXTERNAL,
+                                        cv2.CHAIN_APPROX_SIMPLE)
+        for c in contours:
+            x, y, w, h = cv2.boundingRect(c)
+            if w < MIN_W or h < MIN_H:
+                continue
+            if (w + 4) * (h + 4) > MAX_ZONE_COVER * zw * zh:
+                continue  # 几乎覆盖整个候选区 → 背景整体偏亮/偏暗
+            # 均匀块过滤: letterbox 黑边/纯色背景不是水印
+            roi_orig = roi[y:y + h, x:x + w]
+            if roi_orig.size and float(roi_orig.std()) < 10:
+                continue
+            fill = _rect_fill(binary, x, y, w, h)
+            if fill < MIN_FILL:
+                continue
+            if h > 1.3 * w and w < 0.18 * zw:
+                continue  # 细高竖条 → 更可能是画面内容
+            rects.append((x, y, x + w, y + h))
+
+    return [(x + zx, y + zy, x2 + zx, y2 + zy) for (x, y, x2, y2) in rects]
+
+
+# ---------------- 白字通道（仅图片模式） ----------------
+# 半透明白色水印（如小红书用户名）经视频压缩后绝对亮度可低至 ~130，
+# 固定亮阈值会整体漏检。其本质特征是「低饱和 + 局部显著」：
+#   * HSV 亮度 > WHITE_V_MIN 且饱和度 < WHITE_S_MAX → 近乎消色差的白字前景
+#   * 白字候选区与已检出区域重叠 → 视为同一水印的就地扩展
+#   * 独立白字候选区需同时通过 锐度/面积/边缘密度 三重门，防止把
+#     月光、衣袍高光等低饱和画面内容误判为水印
+WHITE_V_MIN = 100
+WHITE_S_MAX = 70
+WHITE_LAP_MIN = 1500    # 拉普拉斯方差下限: 文字笔画是锐利高频结构
+WHITE_AREA_MIN = 6000   # 独立候选区最小面积
+WHITE_CANNY_MAX = 0.15  # Canny 边缘密度上限: 光晕类误检边缘稀疏或过密
+
+
+def _white_zone_rects(roi_bgr: np.ndarray, zx: int, zy: int,
+                      zw: int, zh: int) -> list:
+    """低饱和白字通道：捕获半透明白色水印文字/图形。"""
+    if zw < 40 or zh < 20:
+        return []
+    hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
+    binary = np.where((hsv[..., 2] > WHITE_V_MIN) &
+                      (hsv[..., 1] < WHITE_S_MAX),
+                      255, 0).astype(np.uint8)
+    gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
+    close_k = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 5))
+    dil_k = cv2.getStructuringElement(cv2.MORPH_RECT, (11, 5))
+    processed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, close_k)
+    dil = cv2.dilate(processed, dil_k)
+    contours, _ = cv2.findContours(dil, cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+    rects = []
+    for c in contours:
+        x, y, w, h = cv2.boundingRect(c)
+        if w < MIN_W or h < MIN_H:
+            continue
+        if (w + 4) * (h + 4) > MAX_ZONE_COVER * zw * zh:
+            continue
+        sub = gray[y:y + h, x:x + w]
+        if sub.size and float(sub.std()) < 10:
+            continue
+        if _rect_fill(binary, x, y, w, h) < MIN_FILL:
+            continue
+        if h > 1.3 * w and w < 0.18 * zw:
+            continue
+        rects.append((x + zx, y + zy, x + zx + w, y + zy + h))
+    return rects
+
+
+def _white_sharp_ok(gray: np.ndarray, x1: int, y1: int,
+                    x2: int, y2: int) -> bool:
+    """独立白字候选区的三重准入校验（锐度 + 面积 + 边缘密度）。"""
+    w, h = x2 - x1, y2 - y1
+    if w * h < WHITE_AREA_MIN:
+        return False
+    sub = gray[y1:y2, x1:x2]
+    if sub.size == 0:
+        return False
+    lap = cv2.Laplacian(sub, cv2.CV_64F).var()
+    if lap < WHITE_LAP_MIN:
+        return False
+    edges = cv2.Canny(sub, 60, 160)
+    return float((edges > 0).mean()) < WHITE_CANNY_MAX
+
+
+def _is_edge_attached(x1, y1, x2, y2, W, H) -> bool:
+    """贴边判定: 平台水印必然贴近画面边缘(角标/条带), 中央块多为内容。"""
+    mx = max(8.0, EDGE_MARGIN * W)
+    my = max(8.0, EDGE_MARGIN * H)
+    return (x1 <= mx or y1 <= my or
+            x2 >= W - mx or y2 >= H - my)
+
+
+def _passes_global(x1: int, y1: int, x2: int, y2: int,
+                   W: int, H: int) -> tuple | None:
+    """全局过滤(尺寸/贴边/字幕保护)，通过则返回外扩 PAD 后的矩形。"""
+    x = max(0, x1 - PAD)
+    y = max(0, y1 - PAD)
+    x2 = min(W, x2 + PAD)
+    y2 = min(H, y2 + PAD)
+    w, h = x2 - x, y2 - y
+    if w < MIN_W or h < MIN_H:
+        return None
+    # 尺寸限制: 超大块是画面内容而非水印
+    if w > MAX_REGION_W * W or h > MAX_REGION_H * H:
+        return None
+    # 贴边必须: 平台水印都在画面边缘
+    if not _is_edge_attached(x, y, x2, y2, W, H):
+        return None
+    # 字幕保护: 底部中央区域的横向长条(字幕)
+    cx = (x + x2) / 2.0 / W
+    if y > 0.80 * H and SUBTITLE_GUARD_X[0] < cx < SUBTITLE_GUARD_X[1]:
+        return None
+    return (x, y, x2, y2)
+
+
+def _overlap_area(a, b) -> int:
+    ix = max(0, min(a[2], b[2]) - max(a[0], b[0]))
+    iy = max(0, min(a[3], b[3]) - max(a[1], b[1]))
+    return ix * iy
+
+
+def _augment_white_text(frame_bgr: np.ndarray, gray: np.ndarray,
+                        regions: list[Region]) -> list[Region]:
+    """图片模式白字通道增强：
+    1) 与已检出区域重叠的白字候选 → 就地扩展该区域(覆盖半透明用户名等)
+    2) 独立候选区需通过锐度/面积/边缘密度三重门才追加为新区域
+    """
+    H, W = frame_bgr.shape[:2]
+    white_rects = []
+    for _name, rx, ry, rw, rh in CANDIDATE_ZONES:
+        zx, zy = int(rx * W), int(ry * H)
+        zw, zh = int(rw * W), int(rh * H)
+        white_rects.extend(_white_zone_rects(
+            frame_bgr[zy:zy + zh, zx:zx + zw], zx, zy, zw, zh))
+    if not white_rects:
+        return regions
+
+    cand = []
+    for r in _merge_rects(white_rects):
+        pr = _passes_global(r[0], r[1], r[2], r[3], W, H)
+        if pr:
+            cand.append(pr)
+    if not cand:
+        return regions
+
+    boxes = [[r.x, r.y, r.x + r.w, r.y + r.h] for r in regions]
+    for (cx1, cy1, cx2, cy2) in cand:
+        c_area = (cx2 - cx1) * (cy2 - cy1)
+        expanded = False
+        for b in boxes:
+            if _overlap_area((cx1, cy1, cx2, cy2), b) < 0.08 * c_area:
+                continue
+            nx1, ny1 = min(b[0], cx1), min(b[1], cy1)
+            nx2, ny2 = max(b[2], cx2), max(b[3], cy2)
+            if ((nx2 - nx1) <= MAX_REGION_W * W and
+                    (ny2 - ny1) <= MAX_REGION_H * H):
+                b[0], b[1], b[2], b[3] = nx1, ny1, nx2, ny2
+                expanded = True
+                break
+        if expanded:
+            continue
+        # 独立候选区: 三重门校验
+        if _white_sharp_ok(gray, cx1, cy1, cx2, cy2):
+            boxes.append([cx1, cy1, cx2, cy2])
+
+    return [Region(x=b[0], y=b[1], w=b[2] - b[0], h=b[3] - b[1])
+            for b in boxes]
+
+
+def detect_regions(frame_bgr: np.ndarray,
+                   white_text: bool = False) -> list[Region]:
+    """对单帧(或图片)检测水印区域。
+
+    white_text=True 时启用白字通道增强（图片模式专用；视频模式依赖
+    时序验证过滤误检，保持双通道不变以免回归）。
+    """
+    H, W = frame_bgr.shape[:2]
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+
+    all_rects = []
+    for _name, rx, ry, rw, rh in CANDIDATE_ZONES:
+        zx, zy = int(rx * W), int(ry * H)
+        zw, zh = int(rw * W), int(rh * H)
+        all_rects.extend(_analyze_zone(gray, zx, zy, zw, zh))
+
+    merged = _merge_rects(all_rects)
+
+    regions = []
+    for (x1, y1, x2, y2) in merged:
+        pr = _passes_global(x1, y1, x2, y2, W, H)
+        if pr:
+            regions.append(Region(x=pr[0], y=pr[1],
+                                 w=pr[2] - pr[0], h=pr[3] - pr[1]))
+
+    if white_text:
+        regions = _augment_white_text(frame_bgr, gray, regions)
+    return regions
+
+
+# ---------------- 视频时序轨迹 ----------------
+
+@dataclass
+class Track:
+    """水印的时空轨迹：一个矩形在 [t0,t1] 时间段内出现。"""
+    x1: int
+    y1: int
+    x2: int
+    y2: int
+    t0: float
+    t1: float
+    hits: int = 1
+    frame_idx: list = None  # 命中的采样帧索引(时序验证用)
+
+    def __post_init__(self):
+        if self.frame_idx is None:
+            self.frame_idx = []
+
+    @property
+    def w(self):
+        return self.x2 - self.x1
+
+    @property
+    def h(self):
+        return self.y2 - self.y1
+
+
+def _track_iou(tr: Track, r: Region) -> float:
+    return _iou((tr.x1, tr.y1, tr.x2, tr.y2), (r.x, r.y, r.x2, r.y2))
+
+
+def build_tracks(samples, gap=1.2, min_hits=3, frames_gray=None):
+    """samples: [(t, [Region...])] 按 t 升序。
+    frames_gray: 与 samples 对齐的灰度帧列表(可选) —— 用于时序稳定性验证。
+    返回 Track 列表 —— 支持 TikTok 水印移动(不同位置→不同 Track)。
+    """
+    active: list[Track] = []
+    finished: list[Track] = []
+
+    for fi, (t, regions) in enumerate(samples):
+        for r in regions:
+            best_iou, best_idx = 0.0, -1
+            for i, tr in enumerate(active):
+                iou = _track_iou(tr, r)
+                if iou > 0.12 and iou > best_iou:
+                    best_iou, best_idx = iou, i
+            if best_idx >= 0:
+                tr = active[best_idx]
+                tr.x1, tr.y1 = min(tr.x1, r.x), min(tr.y1, r.y)
+                tr.x2, tr.y2 = max(tr.x2, r.x2), max(tr.y2, r.y2)
+                tr.t1 = t
+                tr.hits += 1
+                tr.frame_idx.append(fi)
+            else:
+                tr_new = Track(r.x, r.y, r.x2, r.y2, t, t)
+                tr_new.frame_idx.append(fi)
+                active.append(tr_new)
+
+        rest = []
+        for tr in active:
+            if t - tr.t1 > gap:
+                finished.append(tr)
+            else:
+                rest.append(tr)
+        active = rest
+
+    finished.extend(active)
+    keep = [tr for tr in finished if tr.hits >= min_hits]
+    keep = _temporal_verify(keep, samples, frames_gray)
+    keep = _merge_tracks_spatially(keep)
+    return keep
+
+
+def _merge_tracks_spatially(tracks):
+    """空间合并: 位置重叠的 Track 合并为一个(矩形并集+时段并集)。
+
+    水印区域因背景干扰偶发漏检导致 Track 分裂 → 合并保证覆盖完整。
+    """
+    if len(tracks) <= 1:
+        return tracks
+    result = list(tracks)
+    changed = True
+    while changed:
+        changed = False
+        out = []
+        while result:
+            tr = result.pop()
+            i = 0
+            while i < len(result):
+                a = result[i]
+                if _iou((tr.x1, tr.y1, tr.x2, tr.y2),
+                        (a.x1, a.y1, a.x2, a.y2)) > 0.05:
+                    tr = Track(min(tr.x1, a.x1), min(tr.y1, a.y1),
+                               max(tr.x2, a.x2), max(tr.y2, a.y2),
+                               min(tr.t0, a.t0), max(tr.t1, a.t1),
+                               tr.hits + a.hits)
+                    result.pop(i)
+                    changed = True
+                else:
+                    i += 1
+            out.append(tr)
+        result = out
+    return result
+
+
+def _temporal_verify(tracks, samples, frames_gray,
+                     min_static=0.10, std_th=20.0):
+    """时序稳定性验证(静态叠加层原理)：
+
+    水印是叠加在画面上的静态图层 → 区域内水印像素随时间标准差≈0；
+    画面内容(人物/光影)持续运动 → 时间标准差高。
+    只用 Track 的命中帧验证: 命中帧水印必然在场, 误检块在命中帧间
+    也随画面运动, 静态比例低 → 丢弃。
+    """
+    if not frames_gray or len(frames_gray) < 4 or not tracks:
+        return tracks
+    kept = []
+    for tr in tracks:
+        idx = tr.frame_idx or []
+        if len(idx) < 3:
+            kept.append(tr)
+            continue
+        stack = np.stack([frames_gray[i] for i in idx]).astype(np.float32)
+        H, W = stack.shape[1], stack.shape[2]
+        y1, y2 = max(0, tr.y1), min(H, tr.y2)
+        x1, x2 = max(0, tr.x1), min(W, tr.x2)
+        if x2 - x1 < 4 or y2 - y1 < 4:
+            continue
+        roi = stack[:, y1:y2, x1:x2]
+        std_map = roi.std(axis=0)
+        static_ratio = float((std_map < std_th).mean())
+        if static_ratio >= min_static:
+            kept.append(tr)
+    return kept
+
+
+def draw_regions(frame_bgr: np.ndarray, regions, with_mask=True) -> np.ndarray:
+    """在帧上绘制检测标注(红框+半透明填充)，用于前端可视化。"""
+    vis = frame_bgr.copy()
+    overlay = vis.copy()
+    for r in regions:
+        cv2.rectangle(overlay, (r.x, r.y), (r.x2, r.y2), (60, 60, 235), -1)
+    if with_mask:
+        vis = cv2.addWeighted(overlay, 0.32, vis, 0.68, 0)
+    for r in regions:
+        cv2.rectangle(vis, (r.x, r.y), (r.x2, r.y2), (60, 60, 235), 2)
+    return vis
