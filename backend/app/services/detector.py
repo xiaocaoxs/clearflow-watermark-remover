@@ -30,6 +30,7 @@ CANDIDATE_ZONES = [
 
 BRIGHT_THRESHOLD = 193  # 白色前景亮度阈值
 DARK_THRESHOLD = 58     # 深色阴影阈值
+BRIGHT_LAP_MIN = 400    # 亮通道候选的拉普拉斯下限: 过滤云彩/亮墙等平坦亮部误检
 MIN_W = 24              # 最小矩形宽
 MIN_H = 7               # 最小矩形高
 MAX_ZONE_COVER = 0.55    # 矩形不许超过候选区域面积的一半(防背景误检)
@@ -37,7 +38,7 @@ MIN_FILL = 0.12         # 原二值图在矩形内的填充率下限
 MAX_REGION_W = 0.34     # 单区域最大宽度(相对帧宽) —— 超过视为内容块
 MAX_REGION_H = 0.22     # 单区域最大高度(相对帧高, 兼容 logo+两行文字+阴影)
 SUBTITLE_GUARD_X = (0.30, 0.70)  # 底部中央字幕保护带(相对宽度)
-EDGE_MARGIN = 0.025     # 贴边判定: 距任一边 < 2.5% 视为贴边
+EDGE_MARGIN = 0.07      # 贴边判定: 角标常离边 30px 左右，不能要求贴死像素
 PAD = 6                 # 输出矩形外扩像素
 
 
@@ -87,6 +88,33 @@ def _near(a, b, dist=14) -> bool:
     return True
 
 
+def _merge_rects_capped(rects, W, H, iou_th=0.02):
+    """合并笔画，但拒绝并成超过水印尺寸上限的框。"""
+    boxes = [list(r) for r in rects]
+    changed = True
+    while changed and len(boxes) > 1:
+        changed = False
+        out = []
+        while boxes:
+            b = boxes.pop()
+            i = 0
+            while i < len(boxes):
+                a = boxes[i]
+                union = [min(b[0], a[0]), min(b[1], a[1]),
+                         max(b[2], a[2]), max(b[3], a[3])]
+                too_big = ((union[2] - union[0]) > MAX_REGION_W * W or
+                           (union[3] - union[1]) > MAX_REGION_H * H)
+                if not too_big and (_iou(b, a) > iou_th or _near(b, a)):
+                    b = union
+                    boxes.pop(i)
+                    changed = True
+                else:
+                    i += 1
+            out.append(b)
+        boxes = out
+    return [tuple(b) for b in boxes]
+
+
 def _merge_rects(rects, iou_th=0.02):
     """迭代合并重叠/紧邻矩形，取外接并集。rects: [(x1,y1,x2,y2)]"""
     boxes = [list(r) for r in rects]
@@ -133,7 +161,7 @@ def _analyze_zone(gray: np.ndarray, zx: int, zy: int, zw: int, zh: int):
     close_k = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 5))
     dil_k = cv2.getStructuringElement(cv2.MORPH_RECT, (11, 5))
 
-    for binary in (bright, dark):
+    for is_bright, binary in ((True, bright), (False, dark)):
         processed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, close_k)
         dil = cv2.dilate(processed, dil_k)
         contours, _ = cv2.findContours(dil, cv2.RETR_EXTERNAL,
@@ -147,6 +175,9 @@ def _analyze_zone(gray: np.ndarray, zx: int, zy: int, zw: int, zh: int):
             # 均匀块过滤: letterbox 黑边/纯色背景不是水印
             roi_orig = roi[y:y + h, x:x + w]
             if roi_orig.size and float(roi_orig.std()) < 10:
+                continue
+            # 亮通道: 平坦的明亮画面内容(云彩/白墙/过曝)非文字水印, 用锐度过滤
+            if is_bright and cv2.Laplacian(roi_orig, cv2.CV_64F).var() < BRIGHT_LAP_MIN:
                 continue
             fill = _rect_fill(binary, x, y, w, h)
             if fill < MIN_FILL:
@@ -167,9 +198,10 @@ def _analyze_zone(gray: np.ndarray, zx: int, zy: int, zw: int, zh: int):
 #     月光、衣袍高光等低饱和画面内容误判为水印
 WHITE_V_MIN = 100
 WHITE_S_MAX = 70
-WHITE_LAP_MIN = 1500    # 拉普拉斯方差下限: 文字笔画是锐利高频结构
-WHITE_AREA_MIN = 6000   # 独立候选区最小面积
-WHITE_CANNY_MAX = 0.15  # Canny 边缘密度上限: 光晕类误检边缘稀疏或过密
+WHITE_BBOX_LAP_MIN = 400   # 单块候选的拉普拉斯下限: 过滤柱子/墙面/天空等平坦低饱和画面内容
+WHITE_LAP_MIN = 1500       # 独立候选区拉普拉斯方差下限: 文字笔画是锐利高频结构
+WHITE_AREA_MIN = 6000      # 独立候选区最小面积
+WHITE_CANNY_MAX = 0.15     # Canny 边缘密度上限: 光晕类误检边缘稀疏或过密
 
 
 def _white_zone_rects(roi_bgr: np.ndarray, zx: int, zy: int,
@@ -197,6 +229,9 @@ def _white_zone_rects(roi_bgr: np.ndarray, zx: int, zy: int,
             continue
         sub = gray[y:y + h, x:x + w]
         if sub.size and float(sub.std()) < 10:
+            continue
+        # 平坦的低饱和画面内容(墙/柱/天空)非文字: 用锐度预过滤
+        if cv2.Laplacian(sub, cv2.CV_64F).var() < WHITE_BBOX_LAP_MIN:
             continue
         if _rect_fill(binary, x, y, w, h) < MIN_FILL:
             continue
@@ -325,12 +360,25 @@ def detect_regions(frame_bgr: np.ndarray,
 
     merged = _merge_rects(all_rects)
 
-    regions = []
+    # 并集会把角标和旁边的亮部合成超大框，随后被尺寸过滤整块丢掉。
+    # 超大框丢弃后，把仍符合尺寸的原始小框拣回来。
+    kept_boxes = []
     for (x1, y1, x2, y2) in merged:
         pr = _passes_global(x1, y1, x2, y2, W, H)
         if pr:
-            regions.append(Region(x=pr[0], y=pr[1],
-                                 w=pr[2] - pr[0], h=pr[3] - pr[1]))
+            kept_boxes.append(pr)
+            continue
+        for (a, b, c, d) in all_rects:
+            if a < x1 - 2 or b < y1 - 2 or c > x2 + 2 or d > y2 + 2:
+                continue
+            member = _passes_global(a, b, c, d, W, H)
+            if member:
+                kept_boxes.append(member)
+    kept_boxes = _merge_rects_capped(kept_boxes, W, H)
+
+    regions = []
+    for (x1, y1, x2, y2) in kept_boxes:
+        regions.append(Region(x=x1, y=y1, w=x2 - x1, h=y2 - y1))
 
     if white_text:
         regions = _augment_white_text(frame_bgr, gray, regions)
@@ -350,10 +398,19 @@ class Track:
     t1: float
     hits: int = 1
     frame_idx: list = None  # 命中的采样帧索引(时序验证用)
+    obs_x1: list = None
+    obs_y1: list = None
+    obs_x2: list = None
+    obs_y2: list = None
 
     def __post_init__(self):
         if self.frame_idx is None:
             self.frame_idx = []
+        if self.obs_x1 is None:
+            self.obs_x1 = [self.x1]
+            self.obs_y1 = [self.y1]
+            self.obs_x2 = [self.x2]
+            self.obs_y2 = [self.y2]
 
     @property
     def w(self):
@@ -366,6 +423,21 @@ class Track:
 
 def _track_iou(tr: Track, r: Region) -> float:
     return _iou((tr.x1, tr.y1, tr.x2, tr.y2), (r.x, r.y, r.x2, r.y2))
+
+
+def _size_compatible(tr: Track, r: Region, ratio: float = 1.6) -> bool:
+    tw, th = max(1, tr.w), max(1, tr.h)
+    rw, rh = max(1, r.w), max(1, r.h)
+    return ((1 / ratio) <= (rw / tw) <= ratio and
+            (1 / ratio) <= (rh / th) <= ratio)
+
+
+def _refit_track(tr: Track) -> None:
+    """用各次检测的中位数作为修复框，避免一次误检把轨迹撑满画面。"""
+    tr.x1 = int(np.median(tr.obs_x1))
+    tr.y1 = int(np.median(tr.obs_y1))
+    tr.x2 = int(np.median(tr.obs_x2))
+    tr.y2 = int(np.median(tr.obs_y2))
 
 
 def build_tracks(samples, gap=1.2, min_hits=3, frames_gray=None):
@@ -381,12 +453,16 @@ def build_tracks(samples, gap=1.2, min_hits=3, frames_gray=None):
             best_iou, best_idx = 0.0, -1
             for i, tr in enumerate(active):
                 iou = _track_iou(tr, r)
-                if iou > 0.12 and iou > best_iou:
+                # 尺寸差很大的框不是同一个角标，并进去会把水印框撑到无法整段抹掉
+                if iou > 0.12 and iou > best_iou and _size_compatible(tr, r):
                     best_iou, best_idx = iou, i
             if best_idx >= 0:
                 tr = active[best_idx]
-                tr.x1, tr.y1 = min(tr.x1, r.x), min(tr.y1, r.y)
-                tr.x2, tr.y2 = max(tr.x2, r.x2), max(tr.y2, r.y2)
+                tr.obs_x1.append(r.x)
+                tr.obs_y1.append(r.y)
+                tr.obs_x2.append(r.x2)
+                tr.obs_y2.append(r.y2)
+                _refit_track(tr)
                 tr.t1 = t
                 tr.hits += 1
                 tr.frame_idx.append(fi)
@@ -428,7 +504,7 @@ def _merge_tracks_spatially(tracks):
             while i < len(result):
                 a = result[i]
                 if _iou((tr.x1, tr.y1, tr.x2, tr.y2),
-                        (a.x1, a.y1, a.x2, a.y2)) > 0.05:
+                        (a.x1, a.y1, a.x2, a.y2)) > 0.30:
                     tr = Track(min(tr.x1, a.x1), min(tr.y1, a.y1),
                                max(tr.x2, a.x2), max(tr.y2, a.y2),
                                min(tr.t0, a.t0), max(tr.t1, a.t1),

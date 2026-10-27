@@ -133,8 +133,8 @@ def _process_video(task: Task):
     if duration <= 0:
         raise RuntimeError("无法读取视频时长")
 
-    # 采样策略: 时长短步长密, 上限 48 帧
-    n = min(48, max(12, int(duration / 0.8)))
+    # 采样策略: 时长短步长密, 上限 96 帧(加密采样以稳定跟踪移动水印)
+    n = min(96, max(16, int(duration / 0.4)))
     step = duration / n
     samples = []
     frames_gray = []
@@ -154,7 +154,7 @@ def _process_video(task: Task):
                 frame = cv2.imread(str(frame_path))
         if frame is None:
             continue
-        regions = detector.detect_regions(frame)
+        regions = detector.detect_regions(frame, white_text=True)
         samples.append((t, regions))
         frames_gray.append(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
         task.stage = f"正在检测水印 ({i + 1}/{n})"
@@ -177,7 +177,7 @@ def _process_video(task: Task):
     if remover.extract_frame(task.input_path, mid_t, str(preview_frame)):
         frame = cv2.imread(str(preview_frame))
         if frame is not None:
-            mid_regions = detector.detect_regions(frame)
+            mid_regions = detector.detect_regions(frame, white_text=True)
             vis = detector.draw_regions(frame, mid_regions)
             task.detect_preview = f"{task.id}_detect.jpg"
             cv2.imwrite(str(OUTPUTS / task.detect_preview), vis,

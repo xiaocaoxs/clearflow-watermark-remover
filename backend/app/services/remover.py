@@ -18,9 +18,9 @@ import numpy as np
 from ..config import FFMPEG
 
 # 逐帧修复参数
-REPAIR_PAD = 4        # 检测框外扩像素
+REPAIR_PAD = 2        # 检测框外扩像素；过大会把正常纹理带入修复区
 REPAIR_MARGIN = 24    # inpaint ROI 额外上下文边距(供 Telea 取边界信息)
-REPAIR_RADIUS = 6     # Telea 修复半径
+REPAIR_RADIUS = 3     # 小半径减少纹理被扩散成模糊块
 ENCODER_CRF = "16"    # 高保真(视觉无损)
 ENCODER_PRESET = "medium"
 
@@ -30,8 +30,10 @@ SHAPE_WHITE_V = 110      # 低饱和白字: 亮度下限(半透明白字)
 SHAPE_WHITE_S = 90       # 低饱和白字: 饱和度上限
 SHAPE_COLOR_S = 70       # 彩色 logo: 饱和度下限
 SHAPE_COLOR_V = 130      # 彩色 logo: 亮度下限
-SHAPE_COVER_MAX = 0.55   # mask 覆盖率超限 → 退化为矩形(保去除优先)
-SHAPE_COVER_MIN = 0.005  # 覆盖率过低 → 退化为矩形(半透明水印抓不到笔画)
+SHAPE_COVER_MAX = 0.42   # 覆盖率过高通常表示把明亮背景误当成了水印
+SHAPE_COVER_MIN = 0.003  # 覆盖率过低时不冒险整框修复
+LOCAL_CONTRAST_MIN = 6   # 半透明白字相对局部背景的最小亮度差
+COMPACT_AREA = 0.08      # 小于该占比时把笔画撑开修复；再大就只涂细笔画，避免误伤画面
 
 
 def probe_media(path: str) -> dict:
@@ -78,40 +80,47 @@ def extract_frame(path: str, t: float, out_path: str) -> bool:
     return r.returncode == 0
 
 
-def _extract_shape(roi: np.ndarray, inner: np.ndarray) -> np.ndarray:
-    """提取 ROI(带上下文) 中水印的实际形状 mask。
+def _coverage(mask: np.ndarray, inner: np.ndarray) -> float:
+    return float(np.count_nonzero(mask)) / max(1, float(np.count_nonzero(inner)))
 
-    三通道: 白字(亮) / 半透明白字(低饱和高亮) / 彩色 logo(高饱和高亮)。
-    覆盖率异常时退化为整个水印区矩形 —— 去除干净优先于纹理保留。
-    """
+
+def _extract_shape(roi: np.ndarray, inner: np.ndarray) -> np.ndarray:
+    """提取水印笔画 mask，异常时返回空 mask 以保护原始纹理。"""
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
 
-    bright = cv2.threshold(gray, SHAPE_BRIGHT_TH, 255, cv2.THRESH_BINARY)[1]
+    # 低频背景估计可区分半透明亮字与本来就很亮的平坦背景。
+    local_bg = cv2.GaussianBlur(gray, (0, 0), 3.0)
+    contrast = cv2.subtract(gray, local_bg)
+    bright = np.where((gray > SHAPE_BRIGHT_TH) &
+                      (contrast >= LOCAL_CONTRAST_MIN), 255, 0).astype(np.uint8)
     whiteish = np.where((hsv[..., 2] > SHAPE_WHITE_V) &
-                        (hsv[..., 1] < SHAPE_WHITE_S), 255, 0).astype(np.uint8)
+                        (hsv[..., 1] < SHAPE_WHITE_S) &
+                        (contrast >= LOCAL_CONTRAST_MIN), 255, 0).astype(np.uint8)
     colorful = np.where((hsv[..., 1] > SHAPE_COLOR_S) &
                         (hsv[..., 2] > SHAPE_COLOR_V), 255, 0).astype(np.uint8)
 
-    shape = cv2.bitwise_and(cv2.bitwise_or(cv2.bitwise_or(bright, whiteish),
-                                           colorful), inner)
-    # 彩色通道占比过高 → 背景本身色彩丰富, 弃用彩色通道防误伤
-    col_cov = float((cv2.bitwise_and(colorful, inner) > 0).sum()) / max(1, float((inner > 0).sum()))
-    if col_cov > 0.12:
-        shape = cv2.bitwise_and(cv2.bitwise_or(bright, whiteish), inner)
+    col_cov = _coverage(cv2.bitwise_and(colorful, inner), inner)
+    candidates = cv2.bitwise_or(bright, whiteish)
+    if col_cov <= 0.12:
+        candidates = cv2.bitwise_or(candidates, colorful)
+    shape = cv2.bitwise_and(candidates, inner)
 
-    k = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-    shape = cv2.dilate(cv2.morphologyEx(shape, cv2.MORPH_CLOSE, k), k)
+    # 3x3 闭运算连接断裂笔画，仅膨胀一圈覆盖文字抗锯齿边缘。
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    shape = cv2.morphologyEx(shape, cv2.MORPH_CLOSE, k)
+    shape = cv2.dilate(shape, k, iterations=1)
 
-    cov = float((shape > 0).sum()) / max(1, float((inner > 0).sum()))
+    cov = _coverage(shape, inner)
     if cov < SHAPE_COVER_MIN or cov > SHAPE_COVER_MAX:
-        return inner  # 退化: 保底去除
+        return np.zeros_like(inner)
     return shape
 
 
 def _repair_frame_region(frame: np.ndarray, x1: int, y1: int,
-                         x2: int, y2: int) -> None:
-    """就地修复 frame 中 [x1,y1,x2,y2] 水印区(形状 mask, 保留背景纹理)。"""
+                         x2: int, y2: int,
+                         radius: int = REPAIR_RADIUS) -> None:
+    """修复水印。紧凑角标整框涂掉；更大的区域只涂笔画，避免误伤画面。"""
     H, W = frame.shape[:2]
     rx1, ry1 = max(0, x1 - REPAIR_MARGIN), max(0, y1 - REPAIR_MARGIN)
     rx2, ry2 = min(W, x2 + REPAIR_MARGIN), min(H, y2 + REPAIR_MARGIN)
@@ -120,12 +129,31 @@ def _repair_frame_region(frame: np.ndarray, x1: int, y1: int,
     roi = frame[ry1:ry2, rx1:rx2]
     inner = np.zeros(roi.shape[:2], np.uint8)
     inner[y1 - ry1:y2 - ry1, x1 - rx1:x2 - rx1] = 255
-    mask = _extract_shape(roi, inner)
-    frame[ry1:ry2, rx1:rx2] = cv2.inpaint(roi, mask, REPAIR_RADIUS,
-                                          cv2.INPAINT_TELEA)
+    shape = _extract_shape(roi, inner)
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    inside = gray[inner > 0]
+    bright_frac = float((inside > 200).mean()) if inside.size else 0.0
+    # 紧凑角标把笔画撑开，或对实心白底整框修复。大块区域仍只涂笔画。
+    box_area = max(1, (x2 - x1) * (y2 - y1))
+    compact = box_area <= COMPACT_AREA * H * W
+    ink = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    if compact and bright_frac > 0.28:
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        mask = cv2.dilate(inner, kernel, iterations=2)
+    elif compact and _coverage(shape, inner) >= 0.12:
+        mask = cv2.dilate(shape, ink, iterations=3)
+        mask = cv2.bitwise_and(mask, inner)
+    elif np.any(shape):
+        mask = shape
+    else:
+        return
+
+    repaired = cv2.inpaint(roi, mask, max(1, int(radius)), cv2.INPAINT_TELEA)
+    roi[mask > 0] = repaired[mask > 0]
 
 
-def remove_image(src: str, dst: str, regions, radius: int = 5) -> bool:
+def remove_image(src: str, dst: str, regions,
+                 radius: int = REPAIR_RADIUS) -> bool:
     """图片去水印：形状 mask inpaint 修复(保留背景纹理)。"""
     img = cv2.imread(src, cv2.IMREAD_COLOR)
     if img is None:
@@ -139,7 +167,7 @@ def remove_image(src: str, dst: str, regions, radius: int = 5) -> bool:
         x2, y2 = min(W, r.x2 + 2), min(H, r.y2 + 2)
         if x2 - x1 < 4 or y2 - y1 < 4:
             continue
-        _repair_frame_region(img, x1, y1, x2, y2)
+        _repair_frame_region(img, x1, y1, x2, y2, radius=radius)
     return cv2.imwrite(dst, img)
 
 
