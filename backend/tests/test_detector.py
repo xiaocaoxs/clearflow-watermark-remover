@@ -25,6 +25,29 @@ class DetectorTests(unittest.TestCase):
             [(r.x, r.y, r.w, r.h) for r in regions],
         )
 
+    def test_reappearing_watermark_keeps_separate_time_ranges(self):
+        region = Region(8, 138, 74, 44)
+        samples = [(t, [region]) for t in (0.0, 0.4, 0.8, 10.0, 10.4, 10.8)]
+
+        tracks = build_tracks(samples)
+
+        self.assertEqual(sorted((tr.t0, tr.t1) for tr in tracks),
+                         [(0.0, 0.8), (10.0, 10.8)])
+
+    def test_multiple_boxes_in_one_frame_do_not_count_as_multiple_hits(self):
+        samples = [(0.0, [Region(8, 138, 74, 44)] * 3)]
+
+        self.assertEqual(build_tracks(samples, min_hits=3), [])
+
+    def test_merged_duplicate_tracks_count_unique_frames(self):
+        samples = [(t, [Region(8, 138, 74, 44)] * 2) for t in (0.0, 0.4, 0.8)]
+
+        tracks = build_tracks(samples)
+
+        self.assertEqual(len(tracks), 1)
+        self.assertEqual(tracks[0].hits, 3)
+        self.assertEqual(tracks[0].frame_idx, [0, 1, 2])
+
     def test_track_stays_on_logo_when_one_hit_is_oversized(self):
         """一次重叠的大框不能把轨迹撑成整块画面，否则时序过滤会丢掉水印。"""
         frames = []

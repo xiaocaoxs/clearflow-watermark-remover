@@ -452,6 +452,8 @@ def build_tracks(samples, gap=1.2, min_hits=3, frames_gray=None):
         for r in regions:
             best_iou, best_idx = 0.0, -1
             for i, tr in enumerate(active):
+                if t - tr.t1 > gap or fi in tr.frame_idx:
+                    continue
                 iou = _track_iou(tr, r)
                 # 尺寸差很大的框不是同一个角标，并进去会把水印框撑到无法整段抹掉
                 if iou > 0.12 and iou > best_iou and _size_compatible(tr, r):
@@ -487,10 +489,7 @@ def build_tracks(samples, gap=1.2, min_hits=3, frames_gray=None):
 
 
 def _merge_tracks_spatially(tracks):
-    """空间合并: 位置重叠的 Track 合并为一个(矩形并集+时段并集)。
-
-    水印区域因背景干扰偶发漏检导致 Track 分裂 → 合并保证覆盖完整。
-    """
+    """仅合并时间相交且位置重叠的轨迹，保留水印离场的时间间隔。"""
     if len(tracks) <= 1:
         return tracks
     result = list(tracks)
@@ -503,12 +502,15 @@ def _merge_tracks_spatially(tracks):
             i = 0
             while i < len(result):
                 a = result[i]
-                if _iou((tr.x1, tr.y1, tr.x2, tr.y2),
-                        (a.x1, a.y1, a.x2, a.y2)) > 0.30:
+                if (max(tr.t0, a.t0) <= min(tr.t1, a.t1) and
+                        _iou((tr.x1, tr.y1, tr.x2, tr.y2),
+                             (a.x1, a.y1, a.x2, a.y2)) > 0.30):
+                    frame_idx = sorted(set(tr.frame_idx + a.frame_idx))
+                    hits = len(frame_idx) if frame_idx else max(tr.hits, a.hits)
                     tr = Track(min(tr.x1, a.x1), min(tr.y1, a.y1),
                                max(tr.x2, a.x2), max(tr.y2, a.y2),
-                               min(tr.t0, a.t0), max(tr.t1, a.t1),
-                               tr.hits + a.hits)
+                               min(tr.t0, a.t0), max(tr.t1, a.t1), hits)
+                    tr.frame_idx = frame_idx
                     result.pop(i)
                     changed = True
                 else:

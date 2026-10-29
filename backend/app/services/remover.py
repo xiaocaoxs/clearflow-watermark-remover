@@ -33,7 +33,7 @@ SHAPE_COLOR_V = 130      # 彩色 logo: 亮度下限
 SHAPE_COVER_MAX = 0.42   # 覆盖率过高通常表示把明亮背景误当成了水印
 SHAPE_COVER_MIN = 0.003  # 覆盖率过低时不冒险整框修复
 LOCAL_CONTRAST_MIN = 6   # 半透明白字相对局部背景的最小亮度差
-COMPACT_AREA = 0.08      # 小于该占比时把笔画撑开修复；再大就只涂细笔画，避免误伤画面
+COMPACT_AREA = 0.08      # 仅在小区域内尝试识别封闭的实心底牌
 
 
 def probe_media(path: str) -> dict:
@@ -92,11 +92,15 @@ def _extract_shape(roi: np.ndarray, inner: np.ndarray) -> np.ndarray:
     # 低频背景估计可区分半透明亮字与本来就很亮的平坦背景。
     local_bg = cv2.GaussianBlur(gray, (0, 0), 3.0)
     contrast = cv2.subtract(gray, local_bg)
+    outside_contrast = contrast[inner == 0]
+    contrast_min = LOCAL_CONTRAST_MIN
+    if outside_contrast.size:
+        contrast_min = max(contrast_min, min(20.0, float(np.percentile(outside_contrast, 99)) + 3))
     bright = np.where((gray > SHAPE_BRIGHT_TH) &
-                      (contrast >= LOCAL_CONTRAST_MIN), 255, 0).astype(np.uint8)
+                      (contrast >= contrast_min), 255, 0).astype(np.uint8)
     whiteish = np.where((hsv[..., 2] > SHAPE_WHITE_V) &
                         (hsv[..., 1] < SHAPE_WHITE_S) &
-                        (contrast >= LOCAL_CONTRAST_MIN), 255, 0).astype(np.uint8)
+                        (contrast >= contrast_min), 255, 0).astype(np.uint8)
     colorful = np.where((hsv[..., 1] > SHAPE_COLOR_S) &
                         (hsv[..., 2] > SHAPE_COLOR_V), 255, 0).astype(np.uint8)
 
@@ -104,12 +108,16 @@ def _extract_shape(roi: np.ndarray, inner: np.ndarray) -> np.ndarray:
     candidates = cv2.bitwise_or(bright, whiteish)
     if col_cov <= 0.12:
         candidates = cv2.bitwise_or(candidates, colorful)
+    _, labels = cv2.connectedComponents(candidates)
+    crossing = np.unique(labels[inner == 0])
+    candidates[np.isin(labels, crossing[crossing != 0])] = 0
     shape = cv2.bitwise_and(candidates, inner)
 
     # 3x3 闭运算连接断裂笔画，仅膨胀一圈覆盖文字抗锯齿边缘。
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     shape = cv2.morphologyEx(shape, cv2.MORPH_CLOSE, k)
     shape = cv2.dilate(shape, k, iterations=1)
+    shape = cv2.bitwise_and(shape, inner)
 
     cov = _coverage(shape, inner)
     if cov < SHAPE_COVER_MIN or cov > SHAPE_COVER_MAX:
@@ -120,7 +128,7 @@ def _extract_shape(roi: np.ndarray, inner: np.ndarray) -> np.ndarray:
 def _repair_frame_region(frame: np.ndarray, x1: int, y1: int,
                          x2: int, y2: int,
                          radius: int = REPAIR_RADIUS) -> None:
-    """修复水印。紧凑角标整框涂掉；更大的区域只涂笔画，避免误伤画面。"""
+    """按笔画修复；有封闭边界且明显亮于周边的底牌按轮廓修复。"""
     H, W = frame.shape[:2]
     rx1, ry1 = max(0, x1 - REPAIR_MARGIN), max(0, y1 - REPAIR_MARGIN)
     rx2, ry2 = min(W, x2 + REPAIR_MARGIN), min(H, y2 + REPAIR_MARGIN)
@@ -131,21 +139,35 @@ def _repair_frame_region(frame: np.ndarray, x1: int, y1: int,
     inner[y1 - ry1:y2 - ry1, x1 - rx1:x2 - rx1] = 255
     shape = _extract_shape(roi, inner)
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    inside = gray[inner > 0]
-    bright_frac = float((inside > 200).mean()) if inside.size else 0.0
-    # 紧凑角标把笔画撑开，或对实心白底整框修复。大块区域仍只涂笔画。
+    mask = shape
     box_area = max(1, (x2 - x1) * (y2 - y1))
-    compact = box_area <= COMPACT_AREA * H * W
-    ink = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    if compact and bright_frac > 0.28:
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        mask = cv2.dilate(inner, kernel, iterations=2)
-    elif compact and _coverage(shape, inner) >= 0.12:
-        mask = cv2.dilate(shape, ink, iterations=3)
-        mask = cv2.bitwise_and(mask, inner)
-    elif np.any(shape):
-        mask = shape
-    else:
+    if box_area <= COMPACT_AREA * H * W:
+        outside = gray[inner == 0]
+        if outside.size:
+            threshold = max(200.0, float(np.median(outside)) + 35.0)
+            bright = np.where((gray > threshold) & (inner > 0), 255, 0).astype(np.uint8)
+            contours, _ = cv2.findContours(bright, cv2.RETR_EXTERNAL,
+                                           cv2.CHAIN_APPROX_SIMPLE)
+            badge = np.zeros_like(inner)
+            for contour in contours:
+                bx, by, bw, bh = cv2.boundingRect(contour)
+                area = cv2.contourArea(contour)
+                if area < box_area * 0.28 or area < bw * bh * 0.75:
+                    continue
+                # 开放到 ROI 边缘的亮区没有可确认的底牌轮廓。
+                if bx == 0 or by == 0 or bx + bw >= gray.shape[1] or by + bh >= gray.shape[0]:
+                    continue
+                boundary = np.zeros_like(inner)
+                cv2.drawContours(boundary, [contour], -1, 255, 1)
+                ring = cv2.dilate(boundary, np.ones((3, 3), np.uint8))
+                if np.any((ring > 0) & (inner == 0)):
+                    continue
+                cv2.drawContours(badge, [contour], -1, 255, cv2.FILLED)
+            if np.any(badge):
+                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+                badge = cv2.bitwise_and(cv2.dilate(badge, kernel), inner)
+                mask = cv2.bitwise_or(mask, badge)
+    if not np.any(mask):
         return
 
     repaired = cv2.inpaint(roi, mask, max(1, int(radius)), cv2.INPAINT_TELEA)

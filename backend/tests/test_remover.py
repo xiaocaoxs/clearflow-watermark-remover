@@ -46,6 +46,49 @@ class RemoverMaskTests(unittest.TestCase):
         self.assertGreater(np.count_nonzero(changed), 0)
         self.assertFalse(np.any(changed & ~expected))
 
+    def test_compact_bright_background_is_not_erased(self):
+        y, x = np.indices((400, 400))
+        gray = (215 + (x % 17) + (y % 9)).astype(np.uint8)
+        frame = cv2.merge((gray, gray, gray))
+        before = frame.copy()
+
+        remover._repair_frame_region(frame, 30, 140, 150, 200)
+
+        self.assertTrue(np.array_equal(frame, before))
+
+    def test_compact_text_preserves_background_between_letters(self):
+        frame = np.full((400, 400, 3), 80, np.uint8)
+        for x in (40, 60, 80, 100, 120):
+            cv2.rectangle(frame, (x, 150), (x + 3, 175), (245, 245, 245), -1)
+        before = frame.copy()
+
+        remover._repair_frame_region(frame, 30, 140, 140, 190)
+
+        self.assertTrue(np.array_equal(frame[145:185, 48:56], before[145:185, 48:56]))
+        self.assertLess(float(frame[150:176, 40:44].mean()), 120)
+
+    def test_strong_surrounding_texture_does_not_hide_white_text(self):
+        y, x = np.indices((400, 400))
+        gray = (((x + y) % 2) * 255).astype(np.uint8)
+        frame = cv2.merge((gray, gray, gray))
+        frame[140:200, 30:150] = 120
+        frame[155:180, 60:63] = 245
+
+        remover._repair_frame_region(frame, 30, 140, 150, 200)
+
+        self.assertLess(float(frame[155:180, 60:63].mean()), 160)
+
+    def test_shape_does_not_escape_detection_bounds(self):
+        roi = np.full((70, 100, 3), 60, np.uint8)
+        roi[25:45, 30:34] = 245
+        inner = np.zeros((70, 100), np.uint8)
+        inner[25:45, 30:70] = 255
+
+        shape = remover._extract_shape(roi, inner)
+
+        self.assertGreater(np.count_nonzero(shape), 0)
+        self.assertFalse(np.any(shape[inner == 0]))
+
     def test_compact_badge_interior_is_cleared(self):
         """实心白底角标的内部也要被抹掉，不能只擦掉上面的深色字。"""
         frame = np.full((720, 720, 3), (70, 90, 60), np.uint8)
