@@ -16,6 +16,18 @@ results/
 # 测试媒体与素材链接
 test/*.mp4
 test/*.txt
+test/video/
+test/outputs/
+
+# 依赖锁文件(统一用 package-lock.json)
+frontend/yarn.lock
+
+# 零散调试产物
+processed_image_*.png
+
+# Agent 工作区
+.workbuddy/
+.workbuddy-ai/
 
 # 系统
 .DS_Store

@@ -138,6 +138,7 @@ def _process_video(task: Task):
     step = duration / n
     samples = []
     frames_gray = []
+    overlay_masks = []
     cap = cv2.VideoCapture(task.input_path)
     use_cv2 = cap.isOpened()
     frame_path = TEMP / f"{task.id}_frame.jpg"
@@ -157,28 +158,36 @@ def _process_video(task: Task):
         regions = detector.detect_regions(frame, white_text=True)
         samples.append((t, regions))
         frames_gray.append(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+        overlay_masks.append(detector.local_contrast_mask(frame))
         task.stage = f"正在检测水印 ({i + 1}/{n})"
         task.progress = 0.05 + 0.55 * (i + 1) / n
     if use_cv2:
         cap.release()
     frame_path.unlink(missing_ok=True)
 
-    tracks = detector.build_tracks(samples, frames_gray=frames_gray)
+    tracks = detector.build_tracks(samples, min_hits=detector.VIDEO_MIN_HITS,
+                                   frames_gray=frames_gray)
+    # 补漏: 白字压在明亮背景上时逐帧检测拿不到, 用跨帧累积的静态叠加层补齐
+    overlay_tracks = detector.build_overlay_tracks(
+        overlay_masks, [t for t, _ in samples])
+    if overlay_tracks:
+        tracks = detector.merge_track_sets(tracks, overlay_tracks)
+    tracks = detector.filter_bottom_tracks(tracks, info["height"])
     task.tracks = [{
         "x1": tr.x1, "y1": tr.y1, "x2": tr.x2, "y2": tr.y2,
         "t0": round(tr.t0, 2), "t1": round(tr.t1, 2), "hits": tr.hits,
     } for tr in tracks]
 
-    # 检测标注预览(取中间时刻帧)
+    # 检测标注预览: 画最终轨迹在该时刻的激活框, 与逐帧修复范围保持一致
     task.stage = "生成检测预览"
     mid_t = duration / 2
     preview_frame = TEMP / f"{task.id}_mid.jpg"
-    mid_regions = []
     if remover.extract_frame(task.input_path, mid_t, str(preview_frame)):
         frame = cv2.imread(str(preview_frame))
         if frame is not None:
-            mid_regions = detector.detect_regions(frame, white_text=True)
-            vis = detector.draw_regions(frame, mid_regions)
+            active = [detector.Region(x=tr.x1, y=tr.y1, w=tr.w, h=tr.h)
+                      for tr in tracks if tr.t0 <= mid_t <= tr.t1]
+            vis = detector.draw_regions(frame, active)
             task.detect_preview = f"{task.id}_detect.jpg"
             cv2.imwrite(str(OUTPUTS / task.detect_preview), vis,
                         [cv2.IMWRITE_JPEG_QUALITY, 92])

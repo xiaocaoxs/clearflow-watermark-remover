@@ -1,6 +1,6 @@
 """水印检测算法模块。
 
-策略（两阶段、纯规则、零模型依赖）：
+策略（三通道、纯规则、零模型依赖）：
   阶段1 —— 平台先验候选区域：各平台水印(TikTok/抖音/小红书)出现位置已知(角落/底部条带)
   阶段2 —— 区域内亮/暗双通道形态学分析：
             * 亮通道: 白色文字/logo 前景 (阈值二值化)
@@ -8,6 +8,11 @@
             * 闭运算+膨胀把文字笔画连成块 → 轮廓外接矩形
             * 形状/面积/填充率过滤误检
   视频模式：多时间点采样 → 位置聚类成时间轨(Track)，天然支持 TikTok 移动水印。
+  阶段3(仅视频) —— 静态叠加层时序累积：白字压在明亮背景(白墙/枕头)上时，
+            单帧全局亮度阈值会把文字和背景连成一块而被尺寸过滤丢掉；
+            改用局部对比度(顶帽)提取"比周边亮的结构"，再跨帧累积 ——
+            水印是固定叠加层，同一像素在绝大多数帧里都满足该特征，
+            画面内容则会漂移。累积占比达阈值即判为静态水印。
 """
 from __future__ import annotations
 
@@ -38,8 +43,21 @@ MIN_FILL = 0.12         # 原二值图在矩形内的填充率下限
 MAX_REGION_W = 0.34     # 单区域最大宽度(相对帧宽) —— 超过视为内容块
 MAX_REGION_H = 0.22     # 单区域最大高度(相对帧高, 兼容 logo+两行文字+阴影)
 SUBTITLE_GUARD_X = (0.30, 0.70)  # 底部中央字幕保护带(相对宽度)
+SUBTITLE_BAND_Y = 0.82   # 底部字幕带: 起始高度(相对帧高)
+SUBTITLE_MIN_W = 0.20    # 底部字幕带内, 宽度超过此比例(相对帧宽)视为字幕横排
 EDGE_MARGIN = 0.07      # 贴边判定: 角标常离边 30px 左右，不能要求贴死像素
 PAD = 6                 # 输出矩形外扩像素
+
+# 静态叠加层通道(视频专用) —— 局部对比度 + 跨帧累积
+OVERLAY_TOPHAT_K = 19     # 顶帽核边长(基准帧宽 944px, 按实际宽度缩放)
+OVERLAY_TOPHAT_TH = 26    # 顶帽响应阈值: 比周边亮多少才算水印笔画
+OVERLAY_MIN_FRAC = 0.62   # 判定"静态叠加"的最小时序占比
+OVERLAY_BOX_PRESENCE = 0.15  # 单帧内该框的笔画占比达到此值即视为"在场"
+OVERLAY_FILL_MIN = 0.02      # 轮廓内笔画占比下限
+
+BOTTOM_BAND_Y = 0.80     # 底部条带起点(相对帧高)
+BOTTOM_MIN_HITS = 8      # 底部条带内的轨迹至少需要的命中次数
+VIDEO_MIN_HITS = 5       # 视频轨迹的最少命中数: 低于此值多为画面内容瞬时误检
 
 
 @dataclass
@@ -285,6 +303,10 @@ def _passes_global(x1: int, y1: int, x2: int, y2: int,
     cx = (x + x2) / 2.0 / W
     if y > 0.80 * H and SUBTITLE_GUARD_X[0] < cx < SUBTITLE_GUARD_X[1]:
         return None
+    # 字幕保护: 底部字幕带内的宽横排块 —— 字幕居中偏左时中心点会落在
+    # 中央带之外, 只看中心点会漏判, 这里按"底部 + 够宽"再兜一次。
+    if y > SUBTITLE_BAND_Y * H and w > SUBTITLE_MIN_W * W:
+        return None
     return (x, y, x2, y2)
 
 
@@ -402,6 +424,7 @@ class Track:
     obs_y1: list = None
     obs_x2: list = None
     obs_y2: list = None
+    mask: np.ndarray = None  # 跨帧累积的笔画掩码(相对轨迹框, 修复时复用)
 
     def __post_init__(self):
         if self.frame_idx is None:
@@ -549,6 +572,137 @@ def _temporal_verify(tracks, samples, frames_gray,
         if static_ratio >= min_static:
             kept.append(tr)
     return kept
+
+
+# ---------------- 静态叠加层通道(视频专用) ----------------
+
+def local_contrast_mask(frame_bgr: np.ndarray) -> np.ndarray:
+    """候选区内的"局部更亮结构"掩码(白顶帽)。
+
+    全局亮度阈值无法区分"白字"和"本来就白的背景"(白墙/枕头/过曝)；
+    顶帽只保留比自身邻域亮出 OVERLAY_TOPHAT_TH 以上的细节，
+    平滑背景与缓慢渐变的亮部被压掉，白字笔画得以保留。
+    """
+    H, W = frame_bgr.shape[:2]
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    k = max(9, int(round(OVERLAY_TOPHAT_K * W / 944.0)) | 1)
+    se = cv2.getStructuringElement(cv2.MORPH_RECT, (k, k))
+    mask = np.zeros((H, W), np.uint8)
+    for _name, rx, ry, rw, rh in CANDIDATE_ZONES:
+        zx, zy = int(rx * W), int(ry * H)
+        zw, zh = int(rw * W), int(rh * H)
+        roi = gray[zy:zy + zh, zx:zx + zw]
+        if roi.size == 0:
+            continue
+        tophat = cv2.morphologyEx(roi, cv2.MORPH_TOPHAT, se)
+        mask[zy:zy + zh, zx:zx + zw] = cv2.threshold(
+            tophat, OVERLAY_TOPHAT_TH, 255, cv2.THRESH_BINARY)[1]
+    return mask
+
+
+def build_overlay_tracks(masks, times, min_frac: float = OVERLAY_MIN_FRAC):
+    """把逐帧局部对比度掩码累积成"静态叠加层"轨迹。
+
+    masks: 与 times 对齐的 local_contrast_mask 结果。
+    只有同一像素在 min_frac 以上的帧里都表现为"局部更亮结构"时才保留 ——
+    水印是固定叠加层，满足该条件；移动的画面内容不满足。
+    """
+    n = len(masks)
+    if n == 0:
+        return []
+    H, W = masks[0].shape
+    acc = np.zeros((H, W), np.float32)
+    for m in masks:
+        acc += (m > 0)
+    persist = (acc >= min_frac * n).astype(np.uint8) * 255
+    if not np.any(persist):
+        return []
+
+    close_k = cv2.getStructuringElement(cv2.MORPH_RECT, (17, 5))
+    dil_k = cv2.getStructuringElement(cv2.MORPH_RECT, (13, 5))
+    dil = cv2.dilate(cv2.morphologyEx(persist, cv2.MORPH_CLOSE, close_k), dil_k)
+    contours, _ = cv2.findContours(dil, cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+
+    boxes = []
+    for c in contours:
+        x, y, w, h = cv2.boundingRect(c)
+        if w < MIN_W or h < MIN_H:
+            continue
+        if float((persist[y:y + h, x:x + w] > 0).mean()) < OVERLAY_FILL_MIN:
+            continue
+        pr = _passes_global(x, y, x + w, y + h, W, H)
+        if pr:
+            boxes.append(pr)
+    if not boxes:
+        return []
+    boxes = _merge_rects_capped(boxes, W, H)
+
+    tracks = []
+    for (x1, y1, x2, y2) in boxes:
+        sub = [(m[y1:y2, x1:x2] > 0) for m in masks]
+        present = [i for i, s in enumerate(sub)
+                   if s.size and float(s.mean()) >= OVERLAY_BOX_PRESENCE]
+        if len(present) < min_frac * n:
+            continue
+        tr = Track(x1, y1, x2, y2,
+                   float(times[present[0]]), float(times[present[-1]]),
+                   hits=len(present))
+        tr.frame_idx = present
+        # 跨帧稳定的笔画位置即为水印本体; 修复时直接复用,
+        # 避免某几帧对比度不足(白字压白底)时抠不出形状而漏修。
+        stroke = np.where(acc[y1:y2, x1:x2] >= min_frac * n,
+                          255, 0).astype(np.uint8)
+        if np.any(stroke):
+            tr.mask = cv2.dilate(stroke, np.ones((3, 3), np.uint8))
+        tracks.append(tr)
+    return tracks
+
+
+def merge_track_sets(primary, extra):
+    """把 extra 中与 primary 位置重叠的轨迹并入, 其余追加。
+
+    逐帧检测拿不到的框(低对比度)由静态叠加层补上；两者指向同一水印时
+    取外接并集与时间并集，避免同一区域被重复修复。
+    """
+    result = [Track(tr.x1, tr.y1, tr.x2, tr.y2, tr.t0, tr.t1, tr.hits,
+                    list(tr.frame_idx), mask=tr.mask) for tr in primary]
+    for ex in extra:
+        hit = False
+        for tr in result:
+            if _iou((tr.x1, tr.y1, tr.x2, tr.y2),
+                    (ex.x1, ex.y1, ex.x2, ex.y2)) < 0.05:
+                continue
+            nx1, ny1 = min(tr.x1, ex.x1), min(tr.y1, ex.y1)
+            nx2, ny2 = max(tr.x2, ex.x2), max(tr.y2, ex.y2)
+            # 框被撑大后原有笔画掩码不再对齐, 只在框不变时沿用
+            keep_mask = ex.mask if (nx1, ny1, nx2, ny2) == (ex.x1, ex.y1,
+                                                            ex.x2, ex.y2) \
+                else (tr.mask if (nx1, ny1, nx2, ny2) == (tr.x1, tr.y1,
+                                                          tr.x2, tr.y2) else None)
+            tr.x1, tr.y1, tr.x2, tr.y2 = nx1, ny1, nx2, ny2
+            tr.t0, tr.t1 = min(tr.t0, ex.t0), max(tr.t1, ex.t1)
+            tr.hits = max(tr.hits, ex.hits)
+            tr.mask = keep_mask
+            tr.frame_idx = sorted(set(tr.frame_idx) | set(ex.frame_idx))
+            hit = True
+            break
+        if not hit:
+            result.append(ex)
+    return result
+
+
+def filter_bottom_tracks(tracks, H: int, min_hits: int = BOTTOM_MIN_HITS):
+    """底部条带内的轨迹需有足够命中数才保留。
+
+    底部条带是字幕高发区: 字幕随台词出现/消失, 只在某一两句台词期间被检出,
+    命中数远低于整段稳定叠加的平台角标。被静态叠加层佐证过的轨迹在合并时
+    已取命中数最大值, 因此不会在这里被误杀。
+    """
+    if H <= 0:
+        return tracks
+    band = BOTTOM_BAND_Y * H
+    return [tr for tr in tracks if tr.y1 <= band or tr.hits >= min_hits]
 
 
 def draw_regions(frame_bgr: np.ndarray, regions, with_mask=True) -> np.ndarray:

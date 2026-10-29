@@ -35,6 +35,13 @@ SHAPE_COVER_MIN = 0.003  # 覆盖率过低时不冒险整框修复
 LOCAL_CONTRAST_MIN = 6   # 半透明白字相对局部背景的最小亮度差
 COMPACT_AREA = 0.08      # 仅在小区域内尝试识别封闭的实心底牌
 
+# 深色底牌(墨迹/黑底 logo): 白字压在黑底上时只修复白字会留下黑色残影
+DARK_PLATE_DELTA = 45    # 相对周边背景中位数的亮度落差下限
+DARK_PLATE_MAX_TH = 90   # 绝对亮度上限: 高于此值不算"黑底"
+DARK_PLATE_MIN_COVER = 0.15  # 底牌占检测框面积下限
+DARK_PLATE_MAX_COVER = 0.90  # 上限: 超过说明整块都是暗部而非底牌
+RESIDUAL_DIFF = 16       # 残差扩张阈值: 与重建背景的最大通道差
+
 
 def probe_media(path: str) -> dict:
     """读取媒体元信息: cv2 取宽高/时长 + ffmpeg stderr 解析音频流。"""
@@ -84,6 +91,44 @@ def _coverage(mask: np.ndarray, inner: np.ndarray) -> float:
     return float(np.count_nonzero(mask)) / max(1, float(np.count_nonzero(inner)))
 
 
+def _dark_plate(gray: np.ndarray, inner: np.ndarray,
+                strokes: np.ndarray) -> np.ndarray | None:
+    """提取 logo 的深色底牌(墨迹/黑底)。
+
+    白字水印常压在黑色墨迹或黑底 logo 上，只修复白字笔画会把底牌留成
+    一块黑斑。判据是「显著暗于周边背景」+「与白字笔画相连」+「面积可观」，
+    三者同时满足才纳入修复，避免把画面里的深色内容误当底牌。
+    """
+    outside = gray[inner == 0]
+    if outside.size == 0:
+        return None
+    bg = float(np.median(outside))
+    th = min(DARK_PLATE_MAX_TH, bg - DARK_PLATE_DELTA)
+    dark = np.where((gray < th) & (inner > 0), 255, 0).astype(np.uint8)
+    if not np.any(dark):
+        return None
+
+    inner_area = max(1, int(np.count_nonzero(inner)))
+    reach = (cv2.dilate(strokes, np.ones((9, 9), np.uint8))
+             if np.any(strokes) else inner)
+    _, labels, stats, _ = cv2.connectedComponentsWithStats(dark, 8)
+    plate = np.zeros_like(dark)
+    for i in range(1, stats.shape[0]):
+        if stats[i, cv2.CC_STAT_AREA] < DARK_PLATE_MIN_COVER * inner_area:
+            continue
+        if not np.any(reach[labels == i]):
+            continue
+        plate[labels == i] = 255
+    if not np.any(plate):
+        return None
+    if float(np.count_nonzero(plate)) / inner_area > DARK_PLATE_MAX_COVER:
+        return None
+    # 闭运算补上白字笔画在底牌上留下的孔洞，整块一起修复
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    plate = cv2.morphologyEx(plate, cv2.MORPH_CLOSE, k)
+    return cv2.bitwise_and(plate, inner)
+
+
 def _extract_shape(roi: np.ndarray, inner: np.ndarray) -> np.ndarray:
     """提取水印笔画 mask，异常时返回空 mask 以保护原始纹理。"""
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
@@ -113,11 +158,33 @@ def _extract_shape(roi: np.ndarray, inner: np.ndarray) -> np.ndarray:
     candidates[np.isin(labels, crossing[crossing != 0])] = 0
     shape = cv2.bitwise_and(candidates, inner)
 
+    # 残差扩张: 用当前掩码重建背景，把仍与重建背景明显不同的像素补进来。
+    # 这些是 logo 的描边色差偏移、半透明软边 —— 留在掩码外会成为 Telea 的
+    # 边界填充源，把描边颜色往里扩散成彩色鬼影。只接受紧贴笔画的残差，
+    # 避免把框内的画面内容也吞进来。
+    if np.any(shape):
+        k5 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        for _ in range(2):
+            bg_est = cv2.inpaint(roi, cv2.dilate(shape, k5), 5, cv2.INPAINT_TELEA)
+            diff = np.abs(roi.astype(np.int16) - bg_est.astype(np.int16)).max(axis=2)
+            extra = np.where((diff > RESIDUAL_DIFF) & (inner > 0),
+                             255, 0).astype(np.uint8)
+            near = cv2.dilate(shape, np.ones((15, 15), np.uint8))
+            grown = cv2.bitwise_or(shape, cv2.bitwise_and(extra, near))
+            if np.array_equal(grown, shape):
+                break
+            shape = grown
+
     # 3x3 闭运算连接断裂笔画，仅膨胀一圈覆盖文字抗锯齿边缘。
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     shape = cv2.morphologyEx(shape, cv2.MORPH_CLOSE, k)
     shape = cv2.dilate(shape, k, iterations=1)
     shape = cv2.bitwise_and(shape, inner)
+
+    plate = _dark_plate(gray, inner, shape)
+    if plate is not None:
+        # 有深色底牌时以底牌为准: 只抹白字会在原位留一块黑斑
+        return cv2.bitwise_or(shape, plate)
 
     cov = _coverage(shape, inner)
     if cov < SHAPE_COVER_MIN or cov > SHAPE_COVER_MAX:
@@ -125,10 +192,32 @@ def _extract_shape(roi: np.ndarray, inner: np.ndarray) -> np.ndarray:
     return shape
 
 
+def _place_hint(hint, rx1: int, ry1: int, inner: np.ndarray) -> np.ndarray:
+    """把相对轨迹框的笔画掩码对齐到 ROI 坐标系(rx1,ry1 为 ROI 左上角)。"""
+    hx1, hy1, hm = hint
+    if hm is None or hm.size == 0:
+        return np.zeros_like(inner)
+    ox, oy = hx1 - rx1, hy1 - ry1
+    hh, hw = hm.shape[:2]
+    sx, sy = max(0, -ox), max(0, -oy)
+    dx, dy = max(0, ox), max(0, oy)
+    ww = min(hw - sx, inner.shape[1] - dx)
+    hh2 = min(hh - sy, inner.shape[0] - dy)
+    out = np.zeros_like(inner)
+    if ww > 0 and hh2 > 0:
+        out[dy:dy + hh2, dx:dx + ww] = hm[sy:sy + hh2, sx:sx + ww]
+    return out
+
+
 def _repair_frame_region(frame: np.ndarray, x1: int, y1: int,
                          x2: int, y2: int,
-                         radius: int = REPAIR_RADIUS) -> None:
-    """按笔画修复；有封闭边界且明显亮于周边的底牌按轮廓修复。"""
+                         radius: int = REPAIR_RADIUS,
+                         mask_hint=None) -> None:
+    """按笔画修复；有封闭边界且明显亮于周边的底牌按轮廓修复。
+
+    mask_hint: (x1, y1, mask) —— 检测阶段跨帧累积的笔画掩码。
+    低对比度帧(白字压白底)单帧抠不出形状时用它兜底，否则水印会整帧漏修。
+    """
     H, W = frame.shape[:2]
     rx1, ry1 = max(0, x1 - REPAIR_MARGIN), max(0, y1 - REPAIR_MARGIN)
     rx2, ry2 = min(W, x2 + REPAIR_MARGIN), min(H, y2 + REPAIR_MARGIN)
@@ -137,11 +226,22 @@ def _repair_frame_region(frame: np.ndarray, x1: int, y1: int,
     roi = frame[ry1:ry2, rx1:rx2]
     inner = np.zeros(roi.shape[:2], np.uint8)
     inner[y1 - ry1:y2 - ry1, x1 - rx1:x2 - rx1] = 255
+    box_area = max(1, (x2 - x1) * (y2 - y1))
+    compact = box_area <= COMPACT_AREA * H * W
     shape = _extract_shape(roi, inner)
+    if mask_hint is not None:
+        # 静态水印的笔画位置跨帧固定, 累积掩码比单帧抠图更完整(白字压白底时
+        # 单帧只能抠到带黑边的部分)。单帧结果只在累积掩码邻域内补充细节,
+        # 防止单帧误检把远处背景块也带进来。
+        hint = _place_hint(mask_hint, rx1, ry1, inner)
+        if np.any(hint):
+            near = cv2.dilate(hint, np.ones((5, 5), np.uint8))
+            shape = cv2.bitwise_or(hint, cv2.bitwise_and(shape, near))
+            shape = cv2.dilate(shape, np.ones((5, 5), np.uint8))
+            shape = cv2.bitwise_and(shape, inner)
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
     mask = shape
-    box_area = max(1, (x2 - x1) * (y2 - y1))
-    if box_area <= COMPACT_AREA * H * W:
+    if compact:
         outside = gray[inner == 0]
         if outside.size:
             threshold = max(200.0, float(np.median(outside)) + 35.0)
@@ -227,7 +327,9 @@ def remove_video(src: str, dst: str, tracks, duration: float,
         x2, y2 = min(W, tr.x2 + REPAIR_PAD), min(H, tr.y2 + REPAIR_PAD)
         if x2 - x1 < 8 or y2 - y1 < 8:
             continue
-        acts.append((t0, t1, x1, y1, x2, y2))
+        hint = ((tr.x1, tr.y1, tr.mask)
+                if getattr(tr, "mask", None) is not None else None)
+        acts.append((t0, t1, x1, y1, x2, y2, hint))
 
     if not acts:
         cap.release()
@@ -252,10 +354,10 @@ def remove_video(src: str, dst: str, tracks, duration: float,
             if not ok or frame is None:
                 break
             t = idx / fps
-            for (t0, t1, x1, y1, x2, y2) in acts:
+            for (t0, t1, x1, y1, x2, y2, hint) in acts:
                 if t < t0 or t > t1:
                     continue
-                _repair_frame_region(frame, x1, y1, x2, y2)
+                _repair_frame_region(frame, x1, y1, x2, y2, mask_hint=hint)
             proc.stdin.write(frame.tobytes())
             idx += 1
             if on_progress and total > 0 and idx % 20 == 0:
