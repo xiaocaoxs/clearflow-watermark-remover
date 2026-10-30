@@ -15,7 +15,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from ..config import FFMPEG
+from ..config import FFMPEG, VIDEO_ENCODER
 
 # 逐帧修复参数
 REPAIR_PAD = 2        # 检测框外扩像素；过大会把正常纹理带入修复区
@@ -339,14 +339,21 @@ def remove_video(src: str, dst: str, tracks, duration: float,
 
     # ---- 第一步: 逐帧修复视频流 ----
     tmp = str(Path(dst).with_name(Path(dst).stem + ".tmp.mp4"))
+    if VIDEO_ENCODER == "libx264":
+        enc_args = ["-c:v", "libx264", "-crf", ENCODER_CRF,
+                    "-preset", ENCODER_PRESET]
+    else:
+        # 缺 libx264 的精简 ffmpeg: mpeg4 内置编码器兜底
+        enc_args = ["-c:v", "mpeg4", "-q:v", "2"]
     cmd = [FFMPEG, "-y", "-f", "rawvideo", "-pix_fmt", "bgr24",
            "-s", f"{W}x{H}", "-r", f"{fps:.6f}", "-i", "pipe:0",
-           "-c:v", "libx264", "-crf", ENCODER_CRF,
-           "-preset", ENCODER_PRESET, "-pix_fmt", "yuv420p",
+           *enc_args, "-pix_fmt", "yuv420p",
            "-movflags", "+faststart", tmp]
+    err_path = tmp + ".err"
+    err_f = open(err_path, "wb")
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
                            stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL)
+                           stderr=err_f)
     idx = 0
     try:
         while True:
@@ -370,9 +377,14 @@ def remove_video(src: str, dst: str, tracks, duration: float,
             proc.stdin.close()
         except Exception:  # noqa: BLE001
             pass
-    if proc.wait() != 0:
+        code = proc.wait()
+        err_f.close()
+    if code != 0:
+        detail = _tail(err_path)
         _safe_unlink(tmp)
-        raise RuntimeError("ffmpeg 视频编码失败")
+        _safe_unlink(err_path)
+        raise RuntimeError(f"ffmpeg 视频编码失败(exit={code}): {detail}")
+    _safe_unlink(err_path)
     if idx == 0:
         _safe_unlink(tmp)
         return False
@@ -413,6 +425,17 @@ def _safe_unlink(path: str):
         os.unlink(path)
     except OSError:
         pass
+
+
+def _tail(path: str, limit: int = 400) -> str:
+    """取错误日志尾部(供线上定位 ffmpeg 失败原因)。"""
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return ""
+    text = data.decode("utf-8", "replace").strip()
+    return text[-limit:]
 
 
 def _run_ffmpeg(cmd, duration: float, on_progress=None) -> bool:

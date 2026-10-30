@@ -7,6 +7,12 @@ __pycache__/
 node_modules/
 frontend/dist/
 
+# 部署包(由 scripts/build_deploy.py 生成)
+deploy/
+
+# 托管平台的应用标记文件
+.wbapp_*.genie
+
 # 运行时数据(上传/输出/临时)
 backend/storage/
 
