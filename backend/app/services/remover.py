@@ -406,6 +406,48 @@ def remove_image(src: str, dst: str, regions,
     return cv2.imwrite(dst, img)
 
 
+def _track_repair_mask(src: str, tr, W: int, H: int):
+    """按轨迹预计算修复掩码，返回 (rx1, ry1, mask)；无效返回 None。
+
+    轨迹框在整段视频里固定，掩码可以跨帧复用 —— 逐帧重算要跑两次残差扩张
+    inpaint，是视频处理的主要耗时来源(实测每区域 22~32ms，而单次修复 inpaint
+    只需 0.1~5ms)。优先用检测阶段跨帧累积的笔画掩码(比单帧更完整)，
+    没有时抽轨迹中段一帧现算。
+    """
+    x1, y1 = max(0, tr.x1 - REPAIR_PAD), max(0, tr.y1 - REPAIR_PAD)
+    x2, y2 = min(W, tr.x2 + REPAIR_PAD), min(H, tr.y2 + REPAIR_PAD)
+    if x2 - x1 < 8 or y2 - y1 < 8:
+        return None
+    rx1, ry1 = max(0, x1 - REPAIR_MARGIN), max(0, y1 - REPAIR_MARGIN)
+    rx2, ry2 = min(W, x2 + REPAIR_MARGIN), min(H, y2 + REPAIR_MARGIN)
+    inner = np.zeros((ry2 - ry1, rx2 - rx1), np.uint8)
+    inner[y1 - ry1:y2 - ry1, x1 - rx1:x2 - rx1] = 255
+
+    hint = getattr(tr, "mask", None)
+    if hint is not None:
+        m = _place_hint((tr.x1, tr.y1, hint), rx1, ry1, inner)
+        if np.any(m):
+            m = cv2.dilate(m, np.ones((5, 5), np.uint8))
+            m = cv2.bitwise_and(m, inner)
+            if np.any(m):
+                return rx1, ry1, m
+
+    cap = cv2.VideoCapture(src)
+    if not cap.isOpened():
+        return None
+    try:
+        cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, (tr.t0 + tr.t1) / 2) * 1000)
+        ok, frame = cap.read()
+    finally:
+        cap.release()
+    if not ok or frame is None:
+        return None
+    m = _extract_shape(frame[ry1:ry2, rx1:rx2], inner)
+    if not np.any(m):
+        return None
+    return rx1, ry1, m
+
+
 def remove_video(src: str, dst: str, tracks, duration: float,
                  has_audio: bool, audio_codec: str = "",
                  step: float = 1.0, on_progress=None) -> bool:
@@ -440,9 +482,11 @@ def remove_video(src: str, dst: str, tracks, duration: float,
         x2, y2 = min(W, tr.x2 + REPAIR_PAD), min(H, tr.y2 + REPAIR_PAD)
         if x2 - x1 < 8 or y2 - y1 < 8:
             continue
-        hint = ((tr.x1, tr.y1, tr.mask)
-                if getattr(tr, "mask", None) is not None else None)
-        acts.append((t0, t1, x1, y1, x2, y2, hint))
+        prepared = _track_repair_mask(src, tr, W, H)
+        if prepared is None:
+            continue
+        rx1, ry1, mask = prepared
+        acts.append((t0, t1, rx1, ry1, mask))
 
     if not acts:
         cap.release()
@@ -474,10 +518,16 @@ def remove_video(src: str, dst: str, tracks, duration: float,
             if not ok or frame is None:
                 break
             t = idx / fps
-            for (t0, t1, x1, y1, x2, y2, hint) in acts:
+            for (t0, t1, rx1, ry1, mask) in acts:
                 if t < t0 or t > t1:
                     continue
-                _repair_frame_region(frame, x1, y1, x2, y2, mask_hint=hint)
+                h, w = mask.shape[:2]
+                patch = frame[ry1:ry1 + h, rx1:rx1 + w]
+                if patch.shape[:2] != mask.shape[:2]:
+                    continue
+                repaired = cv2.inpaint(patch, mask, REPAIR_RADIUS,
+                                       cv2.INPAINT_TELEA)
+                patch[mask > 0] = repaired[mask > 0]
             proc.stdin.write(frame.tobytes())
             idx += 1
             if on_progress and total > 0 and idx % 20 == 0:
