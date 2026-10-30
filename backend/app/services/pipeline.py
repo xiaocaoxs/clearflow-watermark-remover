@@ -93,6 +93,9 @@ def _process_image(task: Task):
     if img is None:
         raise RuntimeError("图片读取失败")
     regions = detector.detect_regions(img, white_text=True)
+    # 过滤误检: 字幕/背景小物件被当成水印时不要上报，也不要修
+    regions = [r for r in regions
+               if not remover.region_is_background(img, r.x, r.y, r.x2, r.y2)]
     task.regions = [r.to_dict() for r in regions]
 
     # 检测标注预览
@@ -173,6 +176,12 @@ def _process_video(task: Task):
     if overlay_tracks:
         tracks = detector.merge_track_sets(tracks, overlay_tracks)
     tracks = detector.filter_bottom_tracks(tracks, info["height"])
+    # 过滤误检: 轨迹落在竹竿/墙沿等背景结构上时，按笔画修复会把整块内容抹掉。
+    # 在轨迹时段内取 3 个时刻取最大覆盖率，避免被个别低对比度帧误杀。
+    tracks = [tr for tr in tracks
+              if not remover.track_is_background(
+                  task.input_path, tr.x1, tr.y1, tr.x2, tr.y2,
+                  [tr.t0 + (tr.t1 - tr.t0) * f for f in (0.15, 0.5, 0.85)])]
     task.tracks = [{
         "x1": tr.x1, "y1": tr.y1, "x2": tr.x2, "y2": tr.y2,
         "t0": round(tr.t0, 2), "t1": round(tr.t1, 2), "hits": tr.hits,

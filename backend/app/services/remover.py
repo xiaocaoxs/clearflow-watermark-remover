@@ -35,6 +35,17 @@ SHAPE_COVER_MIN = 0.003  # 覆盖率过低时不冒险整框修复
 LOCAL_CONTRAST_MIN = 6   # 半透明白字相对局部背景的最小亮度差
 COMPACT_AREA = 0.08      # 仅在小区域内尝试识别封闭的实心底牌
 
+# 彩色水印(如 TikTok 青/粉渐变 logo): 用 LAB 色度相对背景中位数的偏差判定。
+# 比 HSV 饱和度阈值稳，暖色背景不会被整片当成彩色水印。
+CHROMA_DEV_TH = 14
+
+# 误检过滤: 水印是叠加在画面上的"亮层"，其笔画像素明显亮于背景；
+# 而误检到背景结构(竹竿/墙沿/腿部高光)时，所谓笔画就是背景本身，亮度相当。
+# 实测: 真水印「候选亮度-背景亮度」+75~+240，误检 -7~+37。
+TRACK_MIN_BRIGHT_DELTA = 60
+# 兜底: 大面积叠加层即使对比弱也认为是真水印(如白字压白底)
+TRACK_BIG_COVER = 0.15
+
 # 深色底牌(墨迹/黑底 logo): 白字压在黑底上时只修复白字会留下黑色残影
 DARK_PLATE_DELTA = 45    # 相对周边背景中位数的亮度落差下限
 DARK_PLATE_MAX_TH = 90   # 绝对亮度上限: 高于此值不算"黑底"
@@ -129,8 +140,13 @@ def _dark_plate(gray: np.ndarray, inner: np.ndarray,
     return cv2.bitwise_and(plate, inner)
 
 
-def _extract_shape(roi: np.ndarray, inner: np.ndarray) -> np.ndarray:
-    """提取水印笔画 mask，异常时返回空 mask 以保护原始纹理。"""
+def _stroke_candidates(roi: np.ndarray, inner: np.ndarray) -> np.ndarray:
+    """提取"疑似叠加笔画"候选像素(残差扩张与形态学之前)。
+
+    判据: 明显亮于局部背景、低饱和白字、或色度明显偏离背景中位色。
+    与框边界相连的连通域会被剔除 —— 叠加层水印通常完整落在框内，
+    而背景结构(竹竿/墙沿/地平线)会越过检测框。
+    """
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
 
@@ -146,17 +162,36 @@ def _extract_shape(roi: np.ndarray, inner: np.ndarray) -> np.ndarray:
     whiteish = np.where((hsv[..., 2] > SHAPE_WHITE_V) &
                         (hsv[..., 1] < SHAPE_WHITE_S) &
                         (contrast >= contrast_min), 255, 0).astype(np.uint8)
-    colorful = np.where((hsv[..., 1] > SHAPE_COLOR_S) &
-                        (hsv[..., 2] > SHAPE_COLOR_V), 255, 0).astype(np.uint8)
 
-    col_cov = _coverage(cv2.bitwise_and(colorful, inner), inner)
+    # 彩色水印: 相对背景中位色度的偏差, 而不是绝对饱和度
+    # (暖色/木纹背景饱和度高, 用绝对阈值会把整片背景判成彩色水印)
+    lab = cv2.cvtColor(roi, cv2.COLOR_BGR2LAB)
+    a_ch = lab[..., 1].astype(np.int16)
+    b_ch = lab[..., 2].astype(np.int16)
+    outside_px = inner == 0
+    if np.any(outside_px):
+        a_bg = float(np.median(a_ch[outside_px]))
+        b_bg = float(np.median(b_ch[outside_px]))
+    else:
+        a_bg, b_bg = float(np.median(a_ch)), float(np.median(b_ch))
+    chroma_dev = np.maximum(np.abs(a_ch - a_bg), np.abs(b_ch - b_bg))
+    colorful = np.where((chroma_dev > CHROMA_DEV_TH) & (inner > 0),
+                        255, 0).astype(np.uint8)
+
+    col_cov = _coverage(colorful, inner)
     candidates = cv2.bitwise_or(bright, whiteish)
     if col_cov <= 0.12:
         candidates = cv2.bitwise_or(candidates, colorful)
     _, labels = cv2.connectedComponents(candidates)
     crossing = np.unique(labels[inner == 0])
     candidates[np.isin(labels, crossing[crossing != 0])] = 0
-    shape = cv2.bitwise_and(candidates, inner)
+    return cv2.bitwise_and(candidates, inner)
+
+
+def _extract_shape(roi: np.ndarray, inner: np.ndarray) -> np.ndarray:
+    """提取水印笔画 mask，异常时返回空 mask 以保护原始纹理。"""
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    shape = _stroke_candidates(roi, inner)
 
     # 残差扩张: 用当前掩码重建背景，把仍与重建背景明显不同的像素补进来。
     # 这些是 logo 的描边色差偏移、半透明软边 —— 留在掩码外会成为 Telea 的
@@ -207,6 +242,81 @@ def _place_hint(hint, rx1: int, ry1: int, inner: np.ndarray) -> np.ndarray:
     if ww > 0 and hh2 > 0:
         out[dy:dy + hh2, dx:dx + ww] = hm[sy:sy + hh2, sx:sx + ww]
     return out
+
+
+def _roi_and_mask(frame: np.ndarray, x1: int, y1: int, x2: int, y2: int):
+    """按 REPAIR_MARGIN 取 ROI 与框内掩码区。"""
+    H, W = frame.shape[:2]
+    rx1, ry1 = max(0, x1 - REPAIR_MARGIN), max(0, y1 - REPAIR_MARGIN)
+    rx2, ry2 = min(W, x2 + REPAIR_MARGIN), min(H, y2 + REPAIR_MARGIN)
+    if rx2 - rx1 < 8 or ry2 - ry1 < 8:
+        return None, None
+    roi = frame[ry1:ry2, rx1:rx2]
+    inner = np.zeros(roi.shape[:2], np.uint8)
+    inner[y1 - ry1:y2 - ry1, x1 - rx1:x2 - rx1] = 255
+    return roi, inner
+
+
+def region_overlay_stats(frame: np.ndarray, x1: int, y1: int,
+                         x2: int, y2: int) -> tuple[float, float]:
+    """区域叠加特征: (笔画覆盖率, 笔画亮度相对背景的差值)。
+
+    真水印是比背景更亮的叠加层，差值大；误检到背景结构时差值接近 0。
+    """
+    roi, inner = _roi_and_mask(frame, x1, y1, x2, y2)
+    if roi is None:
+        return 1.0, 255.0  # 取不到区域时不做否定判断, 交给原有流程
+    cand = _stroke_candidates(roi, inner)
+    box_area = max(1, (x2 - x1) * (y2 - y1))
+    cov = float(np.count_nonzero(cand)) / box_area
+
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    sel = cand > 0
+    if not np.any(sel) or not np.any(inner == 0):
+        return cov, 0.0
+    fg = float(np.median(gray[sel]))
+    bg = float(np.median(gray[inner == 0]))
+    return cov, fg - bg
+
+
+def region_overlay_coverage(frame: np.ndarray, x1: int, y1: int,
+                            x2: int, y2: int) -> float:
+    """区域内"疑似叠加笔画"占检测框的比例。"""
+    return region_overlay_stats(frame, x1, y1, x2, y2)[0]
+
+
+def region_is_background(frame: np.ndarray, x1: int, y1: int,
+                         x2: int, y2: int) -> bool:
+    """该区域是否更像背景结构(而非水印)。用于过滤误检，避免抹掉画面内容。"""
+    cov, delta = region_overlay_stats(frame, x1, y1, x2, y2)
+    return not (delta >= TRACK_MIN_BRIGHT_DELTA or cov >= TRACK_BIG_COVER)
+
+
+def track_is_background(path: str, x1: int, y1: int, x2: int, y2: int,
+                        times) -> bool:
+    """在轨迹的若干时刻抽帧，判断该轨迹是否其实是背景结构。
+
+    取多时刻的最优证据: 真水印只要在任一时刻呈现"明显亮于背景"的叠加就算成立，
+    避免被个别低对比度帧误杀。
+    """
+    if not times:
+        return False
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        return False
+    best_delta, best_cov = -255.0, 0.0
+    try:
+        for t in times:
+            cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, float(t)) * 1000)
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                continue
+            cov, delta = region_overlay_stats(frame, x1, y1, x2, y2)
+            best_delta = max(best_delta, delta)
+            best_cov = max(best_cov, cov)
+    finally:
+        cap.release()
+    return not (best_delta >= TRACK_MIN_BRIGHT_DELTA or best_cov >= TRACK_BIG_COVER)
 
 
 def _repair_frame_region(frame: np.ndarray, x1: int, y1: int,
@@ -288,6 +398,9 @@ def remove_image(src: str, dst: str, regions,
         x1, y1 = max(0, r.x - 2), max(0, r.y - 2)
         x2, y2 = min(W, r.x2 + 2), min(H, r.y2 + 2)
         if x2 - x1 < 4 or y2 - y1 < 4:
+            continue
+        # 误检到实心背景结构(柱子/墙沿)时宁可不修，也不要抹掉画面内容
+        if region_is_background(img, x1, y1, x2, y2):
             continue
         _repair_frame_region(img, x1, y1, x2, y2, radius=radius)
     return cv2.imwrite(dst, img)
